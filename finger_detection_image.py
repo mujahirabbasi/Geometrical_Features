@@ -34,12 +34,12 @@ PINKY_MCP = 17
 PINKY_PIP = 18
 PINKY_TIP = 20
 
-def crop_and_rotate_finger(image, hand_landmarks, finger_name, base_idx, tip_idx):
+def get_finger_bounding_box(hand_landmarks, finger_name, base_idx, tip_idx, image_shape):
     """
-    Crop finger region and rotate it to be 90 degrees to x-axis (vertical)
+    Get bounding box for finger with base at bottom edge
     """
-    h, w = image.shape[:2]
-    
+    h, w = image_shape[:2]
+
     # Get base and tip points
     base_point = (
         int(hand_landmarks.landmark[base_idx].x * w),
@@ -50,60 +50,117 @@ def crop_and_rotate_finger(image, hand_landmarks, finger_name, base_idx, tip_idx
         int(hand_landmarks.landmark[tip_idx].y * h)
     )
 
-    # Calculate direction vector and angle
+    # Calculate vector and angle
     dx = tip_point[0] - base_point[0]
     dy = tip_point[1] - base_point[1]
     angle = np.degrees(np.arctan2(dy, dx))
 
-    # Calculate extended tip point (1.2x extension towards tip)
-    extended_tip_x = base_point[0] + int(1.2 * dx)
-    extended_tip_y = base_point[1] + int(1.2 * dy)
-    extended_tip = (extended_tip_x, extended_tip_y)
+    # Finger length
+    length = int(1.2 * np.sqrt(dx**2 + dy**2))
 
-    # Center of finger (between base and extended tip)
-    cx = int((base_point[0] + extended_tip[0]) / 2)
-    cy = int((base_point[1] + extended_tip[1]) / 2)
-
-    # Finger length and width (with padding)
-    length = int(1.2 * np.sqrt(dx**2 + dy**2))   # extended length from base to extended tip
-    if finger_name == "Thumb" or finger_name == "Pinky":
-        width = int(length * 0.39)               # keep thumb and pinky width as is
+    # Finger width depends on finger type
+    if finger_name in ["Thumb", "Pinky"]:
+        width = int(length * 0.39)
     else:
-        width = int(length * 0.30)               # set three middle fingers to 0.30
+        width = int(length * 0.30)
 
-    # Create rotated rectangle for cropping
-    rot_rect = ((cx, cy), (width, length), angle - 90)
-    box = cv2.boxPoints(rot_rect)
-    box = np.int0(box)
+    # Calculate center point so that the base of finger aligns with bottom of bounding box
+    # The center should be positioned so that the base is at the bottom edge of the box
+    # Since the rotated rectangle extends length/2 in each direction from center,
+    # we need to position the center at base + length/2 towards tip
+    direction_x = (tip_point[0] - base_point[0]) / np.sqrt(dx**2 + dy**2) if np.sqrt(dx**2 + dy**2) > 0 else 0
+    direction_y = (tip_point[1] - base_point[1]) / np.sqrt(dx**2 + dy**2) if np.sqrt(dx**2 + dy**2) > 0 else 0
     
-    # Get bounding rectangle for cropping
-    x, y, w_crop, h_crop = cv2.boundingRect(box)
+    # Move center towards tip by length/2 so base is at bottom edge
+    cx = base_point[0] + direction_x * (length / 2)
+    cy = base_point[1] + direction_y * (length / 2)
+
+    # Define rotated rectangle for bounding box
+    rot_rect = ((cx, cy), (width, length), angle - 90)  
+    box = cv2.boxPoints(rot_rect).astype(int)
+
+    return box, (cx, cy, width, length, angle - 90)
+
+def crop_finger_region(image, cx, cy, width, length, angle, finger_name="Unknown"):
+    """
+    Crop finger region using the rotation and cropping approach, 
+    and remove black background.
+    """
+    h, w = image.shape[:2]
     
-    # Add padding
-    padding = 20
-    x = max(0, x - padding)
-    y = max(0, y - padding)
-    w_crop = min(w - x, w_crop + 2 * padding)
-    h_crop = min(h - y, h_crop + 2 * padding)
+    # Normalize angle so finger points up
+    if angle > 90 or angle < -90:
+        angle += 180
     
-    # Crop the region
-    cropped = image[y:y+h_crop, x:x+w_crop]
+    # Rotate image
+    M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h))
     
-    if cropped.size == 0:
-        return None, None
+    # Crop
+    x = int(cx - width/2)
+    y = int(cy - length/2)
+    x, y = max(0, x), max(0, y)
+    x2, y2 = min(w, x + width), min(h, y + length)
+    finger_crop = rotated[y:y2, x:x2]
     
-    # Calculate rotation angle to make finger vertical (90 degrees to x-axis)
-    rotation_angle = 90 - angle
+    if finger_crop.size == 0:
+        return finger_crop
     
-    # Get rotation matrix
-    center = (w_crop // 2, h_crop // 2)
-    rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+    # ----------------------------
+    # Remove black background only
+    # ----------------------------
+    # Convert to grayscale
+    gray = cv2.cvtColor(finger_crop, cv2.COLOR_BGR2GRAY)
     
-    # Rotate the cropped image
-    rotated = cv2.warpAffine(cropped, rotation_matrix, (w_crop, h_crop), 
-                            flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    # Print debugging information
+    top_left_pixel = gray[0, 0]
+    min_pixel_value = np.min(gray)
+    print(f"Finger: {finger_name}")
+    print(f"  Top-left pixel value: {top_left_pixel}")
+    print(f"  Minimum pixel value: {min_pixel_value}")
+    print(f"  Image shape: {gray.shape}")
+    print("---")
     
-    return rotated, box
+    # Create mask to keep only finger content
+    # Use a constant threshold value of 100
+    threshold_value = 100
+    
+    print(f"  Using threshold value: {threshold_value}")
+    
+    # Create mask: pixels > threshold_value become visible, others become transparent
+    _, mask = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
+    
+    # Find the topmost non-black pixel (finger tip) and color it red
+    # Convert back to BGR for processing
+    finger_bgr = finger_crop.copy()
+    
+    # Find the topmost non-black pixel and create a larger red dot
+    h, w = gray.shape
+    topmost_red_pixel = None
+    
+    for y in range(h):
+        for x in range(w):
+            if mask[y, x] > 0:  # If pixel is not transparent (not black in mask)
+                # Color a larger area around this pixel red
+                dot_size = 5  # Radius of the red dot (11x11 total)
+                for dy in range(-dot_size, dot_size + 1):
+                    for dx in range(-dot_size, dot_size + 1):
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < h and 0 <= nx < w:  # Check bounds
+                            finger_bgr[ny, nx] = [0, 0, 255]  # BGR format: red = (0, 0, 255)
+                topmost_red_pixel = (x, y)
+                break
+        if topmost_red_pixel is not None:
+            break
+    
+    if topmost_red_pixel:
+        print(f"  Colored topmost pixel area at {topmost_red_pixel} red (11x11 dot)")
+    
+    # Create transparent background
+    b, g, r = cv2.split(finger_bgr)
+    rgba = cv2.merge([b, g, r, mask])  # add alpha channel
+    
+    return rgba   # PNG with transparency
 
 def detect_fingers_in_image(image_path):
     """
@@ -161,18 +218,20 @@ def detect_fingers_in_image(image_path):
                 elif finger_name == "Pinky":
                     base_idx, tip_idx = PINKY_MCP, PINKY_TIP
 
-                # Crop and rotate finger
-                rotated_finger, box = crop_and_rotate_finger(image, hand_landmarks, finger_name, base_idx, tip_idx)
+                # Get bounding box and parameters for finger
+                box, (cx, cy, width, length, angle) = get_finger_bounding_box(hand_landmarks, finger_name, base_idx, tip_idx, image.shape)
                 
-                if rotated_finger is not None:
-                    cropped_fingers[finger_name] = rotated_finger
-                    
-                    # Draw bounding box on result image
-                    cv2.polylines(result_image, [box], isClosed=True, color=color, thickness=2)
-                    
-                    # Add finger label
-                    cv2.putText(result_image, finger_name, (box[0][0], box[0][1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                # Draw bounding box on result image
+                cv2.polylines(result_image, [box], isClosed=True, color=color, thickness=2)
+                
+                # Add finger label
+                cv2.putText(result_image, finger_name, (box[0][0], box[0][1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                # Crop finger region
+                cropped_finger = crop_finger_region(image, cx, cy, width, length, angle, finger_name)
+                if cropped_finger.size > 0:
+                    cropped_fingers[finger_name] = cropped_finger
     else:
         print("No hand detected in the image!")
         return None, None
@@ -189,6 +248,12 @@ def main():
     
     print(f"Processing image: {image_path}")
     
+    # Create output folder
+    output_folder = "output"
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"Created output folder: {output_folder}")
+    
     # Detect fingers and draw bounding boxes
     result_image, cropped_fingers = detect_fingers_in_image(image_path)
     
@@ -196,11 +261,23 @@ def main():
         # Display the main result
         cv2.imshow('Finger Detection with Bounding Boxes', result_image)
         
-        # Display each cropped and rotated finger
-        for finger_name, cropped_finger in cropped_fingers.items():
-            cv2.imshow(f'{finger_name} Finger (Cropped & Rotated)', cropped_finger)
+        # Get base name for output files
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
         
-        print("Press any key to close all windows...")
+        # Save the main result image
+        main_output_path = os.path.join(output_folder, f"finger_detected_{base_name}.jpg")
+        cv2.imwrite(main_output_path, result_image)
+        print(f"Saved: finger_detected_{base_name}.jpg")
+        
+        # Save each cropped finger
+        for finger_name, cropped_finger in cropped_fingers.items():
+            # Save cropped finger image with transparency
+            finger_output_path = os.path.join(output_folder, f"{finger_name.lower()}_{base_name}_cropped.png")
+            cv2.imwrite(finger_output_path, cropped_finger)
+            print(f"Saved: {finger_name.lower()}_{base_name}_cropped.png")
+        
+        print(f"\nAll images saved in '{output_folder}' folder")
+        print("Press any key to close the window...")
         cv2.waitKey(0)
         cv2.destroyAllWindows()
     else:

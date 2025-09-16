@@ -1,5 +1,6 @@
 images/
 videos/
+output/
 *.csv
 *.png
 *.jpg
